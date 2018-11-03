@@ -20,7 +20,8 @@ module OmniAuth
         authorization_endpoint: '/authorize',
         token_endpoint: '/token',
         userinfo_endpoint: '/userinfo',
-        jwks_uri: '/jwk'
+        jwks_uri: '/jwk',
+        end_session_endpoint: nil
       }
       option :issuer
       option :discovery, false
@@ -37,11 +38,11 @@ module OmniAuth
       option :max_age
       option :ui_locales
       option :id_token_hint
-      option :login_hint
       option :acr_values
       option :send_nonce, true
       option :send_scope_to_token_endpoint, true
       option :client_auth_method
+      option :post_logout_redirect_uri
 
       uid { user_info.sub }
 
@@ -82,8 +83,7 @@ module OmniAuth
       end
 
       def request_phase
-        options.issuer = issuer if options.issuer.blank?
-        discover! if options.discovery
+        discover!
         redirect authorize_uri
       end
 
@@ -96,8 +96,7 @@ module OmniAuth
         elsif !request.params['code']
           return fail!(:missing_code, OmniAuth::OpenIDConnect::MissingCodeError.new(request.params['error']))
         else
-          options.issuer = issuer if options.issuer.blank?
-          discover! if options.discovery
+          discover!
           client.redirect_uri = redirect_uri
           client.authorization_code = authorization_code
           access_token
@@ -111,8 +110,50 @@ module OmniAuth
         fail!(:failed_to_connect, e)
       end
 
+      # RP-Initiated Logout
+      # https://openid.net/specs/openid-connect-session-1_0.html#rfc.section.5
+      #
+      # Rails Example:
+      # redirect_to "/auth/omni_oidc/logout?#{{id_token_hint: session['omni_oidc.id_token']}.to_param}"
+      #
+      def logout_phase
+        # Discover to initialize the end_session_endpoint
+        discover!
+
+        # Fetch the id_token_hint from the request.params to send with redirect to the endsession endpoint
+        _id_token = request.params['id_token_hint']
+
+        if end_session_endpoint_is_valid? && _id_token
+          log(:info, "RP-Initiated Logout, redirecting to: #{client_options.end_session_endpoint}")
+          return redirect(end_session_uri(_id_token))
+        end
+
+        # return back nothing if the logout phase has been call but is invalid (should not be)
+        log(:error, "Failed to start RP-Initiated Logout.")
+        return
+      end
+
+      def other_phase
+        # Logout Phase
+        if logout_path_pattern.match(current_path)
+          # Is the current path matching the omniauth local endpoint (request_path + '/logout')
+          logout_phase_response = logout_phase
+          # If there is no response from the logout phase then do not return, allowing call_app! to be called.
+          return logout_phase_response if logout_phase_response
+        end
+        
+        call_app!
+      end
+
       def authorization_code
         request.params['code']
+      end
+
+      def end_session_uri(id_token=nil)
+        return unless end_session_endpoint_is_valid?
+        end_session_uri = URI(client_options.end_session_endpoint)
+        end_session_uri.query = encoded_end_session_uri_query(id_token)
+        end_session_uri.to_s
       end
 
       def authorize_uri
@@ -121,8 +162,10 @@ module OmniAuth
           response_type: options.response_type,
           scope: options.scope,
           state: new_state,
-          login_hint: options.login_hint,
-          prompt: options.prompt,
+          login_hint: request.params['login_hint'],
+          ui_locales: request.params['ui_locales'],
+          claims_locales: request.params['claims_locales'],
+          prompt: request.params['prompt'],
           nonce: (new_nonce if options.send_nonce),
           hd: options.hd,
         }
@@ -143,10 +186,17 @@ module OmniAuth
       end
 
       def discover!
-        client_options.authorization_endpoint = config.authorization_endpoint
-        client_options.token_endpoint = config.token_endpoint
-        client_options.userinfo_endpoint = config.userinfo_endpoint
-        client_options.jwks_uri = config.jwks_uri
+        return unless options.discovery
+        options.issuer = issuer if options.issuer.blank?
+        setup_client_options(config)
+      end
+
+      def setup_client_options(discover)
+        client_options.authorization_endpoint = discover.authorization_endpoint
+        client_options.token_endpoint = discover.token_endpoint
+        client_options.userinfo_endpoint = discover.userinfo_endpoint
+        client_options.jwks_uri = discover.jwks_uri
+        client_options.end_session_endpoint = discover.end_session_endpoint
       end
 
       def user_info
@@ -155,17 +205,20 @@ module OmniAuth
 
       def access_token
         @access_token ||= begin
-          _access_token = client.access_token!(
+          authentication_response = client.access_token!(
             scope: (options.scope if options.send_scope_to_token_endpoint),
             client_auth_method: options.client_auth_method
           )
-          _id_token = decode_id_token _access_token.id_token
+
+          _id_token = decode_id_token authentication_response.id_token
           _id_token.verify!(
             issuer: options.issuer,
             client_id: client_options.identifier,
             nonce: stored_nonce
           )
-          _access_token
+
+          # return the full authentication response aka: access token
+          authentication_response
         end
       end
 
@@ -233,6 +286,44 @@ module OmniAuth
       def redirect_uri
         return client_options.redirect_uri unless request.params['redirect_uri']
         "#{ client_options.redirect_uri }?redirect_uri=#{ CGI.escape(request.params['redirect_uri']) }"
+      end
+
+      # def is_id_token_valid?(id_token, expected = {})
+      #   return false unless id_token
+      #   _decoded_id_token = id_token.kind_of?(::OpenIDConnect::ResponseObject::IdToken)? id_token : decode_id_token(id_token)
+      #
+      #   return false unless _decoded_id_token.exp.to_i > Time.now.to_i
+      #   return false unless _decoded_id_token.iss == (options.issuer || expected[:issuer])
+      #   # aud(ience) can be a string or an array of strings
+      #   unless Array(_decoded_id_token.aud).include?(client_options.identifier || expected[:client_id])
+      #     return false
+      #   end
+      #
+      #   true
+      # end
+      
+      def encoded_end_session_uri_query(id_token)
+        end_session_query_hash={}
+        end_session_query_hash[:id_token_hint] = id_token
+        end_session_query_hash[:post_logout_redirect_uri] = options.post_logout_redirect_uri if is_valid_url? options.post_logout_redirect_uri
+        URI.encode_www_form(end_session_query_hash)
+      end
+
+      def end_session_endpoint_is_valid?
+        client_options.end_session_endpoint != nil
+      end
+
+      def logout_path_pattern
+        %r{\A#{Regexp.quote(request_path)}(/logout)}
+      end
+
+      def is_valid_url?(url)
+        return false unless url
+        uri = URI.parse(url)
+        uri.kind_of?( URI::HTTPS ) || uri.kind_of?( URI::HTTP )
+      rescue URI::InvalidURIError => e
+        log(:error, e.message)
+        false
       end
 
       class CallbackError < StandardError
