@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/kbolduc/omniauth_openid_connect.svg?branch=master)](https://travis-ci.org/kbolduc/omniauth_openid_connect)
+
 # OmniAuth::OpenIDConnect
 
 Originally was [omniauth-openid-connect](https://github.com/jjbohn/omniauth-openid-connect)
