@@ -18,7 +18,7 @@ module OmniAuth
         strategy.request_phase
       end
 
-      def test_logout_phase_with_discovery
+      def test_logout_phase_with_discovery_via_params
         id_token = File.read('test/fixtures/id_token.txt').strip
         expected_redirect = /^https:\/\/example\.com\/logout\?id_token_hint=#{id_token}$/
         strategy.options.client_options.host = 'example.com'
@@ -38,6 +38,32 @@ module OmniAuth
 
         request.stubs(:path_info).returns('/auth/openidconnect/logout')
         request.stubs(:params).returns('id_token_hint' => id_token)
+
+        strategy.expects(:redirect).with(regexp_matches(expected_redirect))
+        strategy.other_phase
+      end
+
+      def test_logout_phase_with_discovery_via_session
+        id_token = File.read('test/fixtures/id_token.txt').strip
+        expected_redirect = /^https:\/\/example\.com\/logout\?id_token_hint=#{id_token}$/
+        strategy.options.name = 'openidconnect'
+        strategy.options.client_options.host = 'example.com'
+        strategy.options.discovery = true
+
+        issuer = stub('OpenIDConnect::Discovery::Issuer')
+        issuer.stubs(:issuer).returns('https://example.com/')
+        ::OpenIDConnect::Discovery::Provider.stubs(:discover!).returns(issuer)
+
+        config = stub('OpenIDConnect::Discovery::Provder::Config')
+        config.stubs(:authorization_endpoint).returns('https://example.com/authorization')
+        config.stubs(:token_endpoint).returns('https://example.com/token')
+        config.stubs(:userinfo_endpoint).returns('https://example.com/userinfo')
+        config.stubs(:jwks_uri).returns('https://example.com/jwks')
+        config.stubs(:end_session_endpoint).returns('https://example.com/logout')
+        ::OpenIDConnect::Discovery::Provider::Config.stubs(:discover!).with('https://example.com/').returns(config)
+
+        request.stubs(:path_info).returns('/auth/openidconnect/logout')
+        strategy.call!('rack.session' => { 'openid_connect.openidconnect.id_token' => id_token })
 
         strategy.expects(:redirect).with(regexp_matches(expected_redirect))
         strategy.other_phase
@@ -103,6 +129,40 @@ module OmniAuth
         strategy.other_phase
       end
 
+      # Refresh Phase tests
+      def test_execute_refresh_token_phase
+        id_token = File.read('test/fixtures/id_token.txt').strip
+        strategy.options.client_options.host = 'example.com'
+        strategy.options.discovery = true
+        strategy.options.refresh_expired_access_token=true
+
+        issuer = stub('OpenIDConnect::Discovery::Issuer')
+        issuer.stubs(:issuer).returns('https://example.com/')
+        ::OpenIDConnect::Discovery::Provider.stubs(:discover!).returns(issuer)
+
+        config = stub('OpenIDConnect::Discovery::Provder::Config')
+        config.stubs(:authorization_endpoint).returns('https://example.com/authorization')
+        config.stubs(:token_endpoint).returns('https://example.com/token')
+        config.stubs(:userinfo_endpoint).returns('https://example.com/userinfo')
+        config.stubs(:jwks_uri).returns('https://example.com/jwks')
+        config.stubs(:end_session_endpoint).returns('https://example.com/logout')
+        ::OpenIDConnect::Discovery::Provider::Config.stubs(:discover!).with('https://example.com/').returns(config)
+
+        request.stubs(:path_info).returns('')
+
+        strategy.call!('rack.session' => {
+            'openid_connect.openidconnect.refresh_token' => 'TOKEN',
+            'openid_connect.openidconnect.expires_at' => (Time.now.to_i - 60)
+        })
+        strategy.stubs(:refresh_token_phase)
+
+        strategy.expects(:refresh_token_phase).once
+        strategy.expects(:call_app!).once
+        strategy.other_phase
+      end
+
+
+
       def test_request_phase_with_params
         expected_redirect = /^https:\/\/example\.com\/authorize\?claims_locales=es&client_id=1234&login_hint=john.doe%40example.com&nonce=\w{32}&prompt=none&response_type=code&scope=openid&state=\w{32}&ui_locales=en$/
         strategy.options.issuer = 'example.com'
@@ -167,6 +227,9 @@ module OmniAuth
         access_token.stubs(:expires_in)
         access_token.stubs(:scope)
         access_token.stubs(:id_token).returns(File.read('test/fixtures/id_token.txt'))
+        access_token.stubs(:token_type).returns('bearer')
+        access_token.stubs(:raw_attributes).returns({'refresh_expires_in' => 0})
+        
         client.expects(:access_token!).at_least_once.returns(access_token)
         access_token.expects(:userinfo!).returns(user_info)
 
@@ -211,6 +274,9 @@ module OmniAuth
         access_token.stubs(:expires_in)
         access_token.stubs(:scope)
         access_token.stubs(:id_token).returns(File.read('test/fixtures/id_token.txt'))
+        access_token.stubs(:token_type).returns('bearer')
+        access_token.stubs(:raw_attributes).returns({'refresh_expires_in' => 0})
+        
         client.expects(:access_token!).at_least_once.returns(access_token)
         access_token.expects(:userinfo!).returns(user_info)
 
@@ -317,9 +383,11 @@ module OmniAuth
         access_token = stub('OpenIDConnect::AccessToken')
         access_token.stubs(:access_token).returns(SecureRandom.hex(16))
         access_token.stubs(:refresh_token).returns(SecureRandom.hex(16))
-        access_token.stubs(:expires_in).returns(Time.now)
+        access_token.stubs(:expires_in).returns(Time.now.to_i)
         access_token.stubs(:scope).returns('openidconnect')
         access_token.stubs(:id_token).returns(File.read('test/fixtures/id_token.txt'))
+        access_token.stubs(:token_type).returns('bearer')
+        access_token.stubs(:raw_attributes).returns({'refresh_expires_in' => 0})
 
         client.expects(:access_token!).returns(access_token)
         access_token.expects(:refresh_token).returns(access_token.refresh_token)
@@ -445,6 +513,17 @@ module OmniAuth
         strategy.options.client_signing_alg = :HS256
         assert_equal strategy.options.client_options.secret, strategy.public_key
       end
+
+      def test_get_session_key
+        assert_equal 'openid_connect.openidconnect.access_token',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_ACCESS_TOKEN)
+        assert_equal 'openid_connect.openidconnect.expires_at',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_EXPIRES_AT)
+        assert_equal 'openid_connect.openidconnect.id_token',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_ID_TOKEN)
+        assert_equal 'openid_connect.openidconnect.refresh_expires_at',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_REFRESH_EXPIRES_AT)
+        assert_equal 'openid_connect.openidconnect.refresh_token',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_REFRESH_TOKEN)
+        assert_equal 'openid_connect.openidconnect.scope',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_SCOPE)
+        assert_equal 'openid_connect.openidconnect.token_type',OpenIDConnect.get_session_key(:openidconnect, OpenIDConnect::SESSION_TYPE_TOKEN_TYPE)
+      end
+
     end
   end
 end
