@@ -1,4 +1,5 @@
 [![Build Status](https://travis-ci.org/kbolduc/omniauth_openid_connect.svg?branch=master)](https://travis-ci.org/kbolduc/omniauth_openid_connect)
+[![Coverage Status](https://coveralls.io/repos/github/kbolduc/omniauth_openid_connect/badge.svg)](https://coveralls.io/github/kbolduc/omniauth_openid_connect)
 
 # OmniAuth::OpenIDConnect
 
